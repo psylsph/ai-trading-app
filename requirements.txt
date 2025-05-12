@@ -1,0 +1,9 @@
+requests
+pandas
+beautifulsoup4
+python-dotenv
+google-generativeai
+alpaca-py
+tradingview-scraper
+setuptools
+json-repair

@@ -1,0 +1,5 @@
+.venv
+.env
+.vscode
+export
+gemini-input.txt
