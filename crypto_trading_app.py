@@ -30,7 +30,7 @@ from requests.exceptions import RequestException # Specific requests exception
 # --- Constants ---
 SYMBOL = "BTCUSD" # Define symbol constant
 PRICING_SYMBOL = "bitcoin"
-SLEEP_INTERVAL_SECONDS = 300 # Define sleep interval constant
+SLEEP_INTERVAL_SECONDS = 600 # Define sleep interval constant
 DEBUG_WRITE_PROMPT = True # Control debug file writing
 
 # Load environment variables from .env file
@@ -412,7 +412,7 @@ def ask_gemini_for_decision(account_data, coin_data, gen_model, sum_model):
             "decision": "HOLD",  # Default to HOLD if there's an error
             "quantity": 0,
             "quantity_unit": "USD",
-            "reasoning": f"Error parsing Gemini response: {e}",
+            "reasoning": f"Error parsing Gemini response: {gen_e}",
             "confidence": "LOW"
         }
 
