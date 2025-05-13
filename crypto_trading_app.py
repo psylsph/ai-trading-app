@@ -5,7 +5,7 @@ Automated Cryptocurrency Trading Application
 This app:
 1. Checks current cryptocurrency balance in an Alpaca account
 2. Fetches coin price and performance data
-3. Uses Google Gemini to analyze data and make trading decisions
+3. Uses local llm to analyze data and make trading decisions
 4. Executes the determined trade on the Alpaca account
 """
 
@@ -14,7 +14,7 @@ import json
 import time
 import requests
 from datetime import datetime
-import google.generativeai as genai
+from openai import OpenAI
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -22,16 +22,17 @@ from tradingview_scraper.symbols.technicals import Indicators
 from tradingview_scraper.symbols.news import NewsScraper
 from dotenv import load_dotenv
 import sys # Added for sys.exit()
-import re # Added for regex in Gemini response parsing
+import re # Added for regex in llm response parsing
 from json_repair import loads as repair_json_loads # Use specific import
 from alpaca.common.exceptions import APIError # Specific Alpaca exception
 from requests.exceptions import RequestException # Specific requests exception
 
 # --- Constants ---
-SYMBOL = "BTCUSD" # Define symbol constant
-PRICING_SYMBOL = "bitcoin"
+SYMBOL = "XRPUSD" # Define symbol constant
+PRICING_SYMBOL = "ripple"
 SLEEP_INTERVAL_SECONDS = 600 # Define sleep interval constant
-DEBUG_WRITE_PROMPT = True # Control debug file writing
+DEBUG = True # Control debug file writing
+llm_client = OpenAI(base_url="http://127.0.0.1:11434/v1", api_key="ollama")
 
 # Load environment variables from .env file
 load_dotenv()
@@ -39,8 +40,7 @@ load_dotenv()
 # Get API keys from environment variables
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_GEMINI_API_KEY")
-# TAAPI_API_KEY removed as it was unused
+
 
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
@@ -49,7 +49,6 @@ headers = {
 # --- Global Clients/Scrapers (Instantiate once) ---
 # Note: API key check happens before this in __main__
 trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True) # Use paper=False for live trading
-genai.configure(api_key=GOOGLE_API_KEY)
 indicators_scraper = Indicators(export_result=False, export_type='json')
 news_scraper = NewsScraper(export_result=False, export_type='json')
 
@@ -139,8 +138,57 @@ def get_technical_indicators(scraper, symbol: str):
     return indicators_data
 
 
+def get_llm_response(system_prompt: str, user_prompt: str, llm_model: str, temperature: float):
+
+    response = llm_client.chat.completions.create(
+        model=llm_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=temperature,
+        top_p=0.95,
+        max_completion_tokens=8192,
+        timeout=6000,
+        stream=True
+    )
+    
+    # create variables to collect the stream of chunks
+    collected_messages = []
+    # iterate through the stream of events
+    for chunk in response:
+        if chunk == None:
+            continue
+        if chunk.choices == None:
+            continue
+        if chunk.choices[0] == None:
+            continue
+        if chunk.choices[0].delta == None:
+            continue
+        if chunk.choices[0].delta.content == None:
+            continue
+        chunk_message = chunk.choices[0].delta.content  # extract the message
+        collected_messages.append(chunk_message)  # save the message
+        if DEBUG:
+            print(chunk_message, end="")
+    # clean None in collected_messages
+    collected_messages = [m for m in collected_messages if m is not None]
+    full_reply_content = ''.join(collected_messages)
+    
+    cleaned_response = full_reply_content.replace("*", "").replace("#", "").replace("\n\n", "\n")
+    cleaned_response = cleaned_response.replace("&", "").replace("\\", "")
+    cleaned_response = cleaned_response.replace("\\hline", "").replace("\\boxed", "").replace("\\textbf", "").replace("\\begin", "")
+    cleaned_response = cleaned_response.replace("</s>", "").replace("[TOOL_CALLS]", "")
+    cleaned_response= cleaned_response.replace("[APPROVED]", "").replace("[REVISE]", "")
+    cleaned_response= cleaned_response.replace("<strong>", "").replace("</strong>", "")
+    
+    if "</think>" in cleaned_response:
+            cleaned_response = cleaned_response.split("</think>")[1]
+
+    return cleaned_response
+
 def summarize_news(news_as_list: list, model):
-    """Summarizes a list of news articles using the provided Gemini model."""
+    """Summarizes a list of news articles using the provided llm model."""
     if not news_as_list:
         return "No news articles provided for summarization."
 
@@ -149,12 +197,13 @@ def summarize_news(news_as_list: list, model):
     As a cryptocurrency trading advisor, please summarize the following news in 200-300 words:
     {str(news_as_list)}"""
     
-    print("Sending news to Google Gemini for summarization...")
+    print(f"Sending news to {summary_model} for summarization...")
     try:
-        response = model.generate_content(prompt)
-        return clean_string(response.text)
+        system_prompt = "You are crypto currency expert."
+        response = get_llm_response(system_prompt, prompt, summary_model, temperature=0.2)
+        return clean_string(response)
     except Exception as e:
-        print(f"Error generating news summary with Gemini: {e}")
+        print(f"Error generating news summary: {e}")
         return "Error generating news summary."
 
 
@@ -209,7 +258,7 @@ def clean_string(input_string):
     output_string = output_string.replace('"', "'").replace('\u2011', '-').replace('\u003c', '<').replace('\u003e', '>')
     return output_string
 
-def get_coin_data(news_scraper_instance, indicators_scraper_instance, gemini_summary_model, symbol: str):
+def get_coin_data(news_scraper_instance, indicators_scraper_instance, summary_model, symbol: str):
     """Aggregates coin data: news, technical, and price."""
     coin_data = {
         "price": None,
@@ -222,7 +271,7 @@ def get_coin_data(news_scraper_instance, indicators_scraper_instance, gemini_sum
         raw_news = get_coin_news(news_scraper_instance, symbol)
         if raw_news:
              # Pass the separate summary model here
-             coin_data["recent_news_summary"] = summarize_news(raw_news, gemini_summary_model)
+             coin_data["recent_news_summary"] = summarize_news(raw_news, summary_model)
              print(f"Recent News Summary:\n{coin_data['recent_news_summary']}")
         else:
              print("No raw news fetched to summarize.")
@@ -300,8 +349,8 @@ def format_technical_indicators(indicators_dict):
         
     return "\n" + "\n".join(formatted_string)
 
-def ask_gemini_for_decision(account_data, coin_data, gen_model, sum_model):
-    """Send data to Google Gemini and get a trading decision"""
+def ask_llm_for_decision(account_data, coin_data, gen_model, sum_model):
+    """Send data to llm and get a trading decision"""
     # Model is now passed in
 
     # Structure the prompt with all relevant information
@@ -314,6 +363,7 @@ def ask_gemini_for_decision(account_data, coin_data, gen_model, sum_model):
     change_7d = coin_data.get('7d_change', 'Unknown')
     tech_indicators = coin_data.get('technical_indicators', {})
     news_summary = coin_data.get('recent_news_summary', 'Not available') # Use updated key
+    clean_symbol = SYMBOL.replace("USD", "")
 
     prompt = f"""
     As a cryptocurrency trading advisor, please analyze the following data and recommend whether to buy, sell or hold coin,
@@ -324,12 +374,12 @@ def ask_gemini_for_decision(account_data, coin_data, gen_model, sum_model):
     ACCOUNT INFORMATION:
     - Available Cash: ${account_cash}
     - Total Portfolio Value: ${portfolio_value}
-    - Maker Fee: 0.15%, Taker Fee: 0.25% (Note: These might vary, check Alpaca docs)
+    - Maker Fee: 0.15%, Taker Fee: 0.25%
 
-    CURRENT {SYMBOL} HOLDINGS:
+    CURRENT {clean_symbol} HOLDINGS:
     {json.dumps(crypto_positions, indent=2)}
 
-    {SYMBOL} MARKET DATA:
+    {clean_symbol} MARKET DATA:
     - Current Price: ${current_price}
     - 24h Change: {f'{change_24h}%' if change_24h is not None else 'Unknown'}
     - 7d Change: {f'{change_7d}%' if change_7d is not None else 'Unknown'}
@@ -339,8 +389,8 @@ def ask_gemini_for_decision(account_data, coin_data, gen_model, sum_model):
     {news_summary}
 
     Based on this information, please provide:
-    1. A clear BUY, SELL or HOLD recommendation for {SYMBOL}
-    2. The quantity to buy or sell (in USD or {SYMBOL})
+    1. A clear BUY, SELL or HOLD recommendation for {clean_symbol}
+    2. The quantity to buy or sell (in USD or {clean_symbol})
     3. Your reasoning for this decision
     4. A confidence level in your recommendation (low, medium, high)
     
@@ -348,30 +398,30 @@ def ask_gemini_for_decision(account_data, coin_data, gen_model, sum_model):
     {{
         "decision": "BUY, SELL or HOLD",
         "quantity": 123.45,
-        "quantity_unit": "USD or {{SYMBOL}}",
+        "quantity_unit": "USD or SYMBOL",
         "reasoning": "Your detailed reasoning here",
         "confidence": "LOW/MEDIUM/HIGH"
     }}
     """
+
+    prompt = prompt.replace("SYMBOL", clean_symbol)
     
-    print("Sending data to Google Gemini for analysis...")
-    if DEBUG_WRITE_PROMPT:
+    print(f"Sending data to {decision_model} for analysis...")
+    if DEBUG:
         try:
             # Use with statement and specify encoding
-            with open('gemini-input.txt', 'w', encoding='utf-8') as f:
+            with open('llm-input.txt', 'w', encoding='utf-8') as f:
                 f.write(prompt)
         except IOError as e:
             print(f"Warning: Could not write debug prompt file: {e}")
 
     try:
+        system_prompt = "You are crypto currency expert."
         try:
-            response = gen_model.generate_content(prompt)
+            response_text = get_llm_response(system_prompt, prompt, decision_model, temperature=0.2)
         except Exception as gen_ex:
             print(f"Warning: could not use {gen_model}: {gen_ex}")
-            response = sum_model.generate_content(prompt)
         
-        response_text = response.text
-
         # Attempt to extract JSON using regex
         # Improved regex for markdown code blocks and plain objects
         json_match = re.search(r'```json\s*({[\s\S]*?})\s*```|({[\s\S]*})', response_text)
@@ -386,7 +436,7 @@ def ask_gemini_for_decision(account_data, coin_data, gen_model, sum_model):
                 decision_data = repair_json_loads(json_str)
                 return decision_data
             except json.JSONDecodeError as json_e:
-                print(f"Error parsing extracted JSON from Gemini response: {json_e}")
+                print(f"Error parsing extracted JSON from llm response: {json_e}")
                 print(f"Extracted JSON string: {json_str}")
                 # Fall through to try parsing the whole text if regex extraction failed to parse
             except Exception as repair_e: # Catch potential errors from repair_json_loads itself
@@ -400,24 +450,24 @@ def ask_gemini_for_decision(account_data, coin_data, gen_model, sum_model):
             decision_data = repair_json_loads(response_text)
             return decision_data
         except Exception as full_repair_e:
-            print(f"Error parsing or repairing full Gemini response: {full_repair_e}")
+            print(f"Error parsing or repairing full llm response: {full_repair_e}")
             print(f"Raw response: {response_text}")
             # Fall through to default HOLD response
 
     except Exception as gen_e: # Catch errors during model.generate_content
-        print(f"Error communicating with Google Gemini: {gen_e}")
+        print(f"Error communicating with llm: {gen_e}")
 
     # Default response if anything fails
         return {
             "decision": "HOLD",  # Default to HOLD if there's an error
             "quantity": 0,
             "quantity_unit": "USD",
-            "reasoning": f"Error parsing Gemini response: {gen_e}",
+            "reasoning": f"Error parsing llm response: {gen_e}",
             "confidence": "LOW"
         }
 
 def execute_trade(client, decision, symbol: str):
-    """Execute the trade on Alpaca based on the Gemini decision"""
+    """Execute the trade on Alpaca based on the llm decision"""
     decision_action = decision.get("decision")
     confidence = decision.get("confidence")
     quantity = decision.get("quantity")
@@ -426,11 +476,11 @@ def execute_trade(client, decision, symbol: str):
 
     # --- Robust Validation ---
     if not decision_action:
-        print("Error: Missing 'decision' in Gemini response.")
+        print("Error: Missing 'decision' in llm response.")
         return False
     
     if not confidence:
-        print("Error: Missing 'confidence' in Gemini response.")
+        print("Error: Missing 'confidence' in llm response.")
         return False
 
 
@@ -518,7 +568,7 @@ def execute_trade(client, decision, symbol: str):
         return False
 
 
-def run_trading_cycle(alpaca_client, gemini_decision_model, gemini_summary_model, news_scraper_instance, indicators_scraper_instance, symbol: str):
+def run_trading_cycle(alpaca_client, decision_model, summary_model, news_scraper_instance, indicators_scraper_instance, symbol: str):
     """Runs one cycle of the trading logic."""
     print("=" * 50)
     print(f"Starting Trading Cycle for {symbol} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -531,13 +581,13 @@ def run_trading_cycle(alpaca_client, gemini_decision_model, gemini_summary_model
         print("Failed to retrieve account data. Skipping cycle.")
         return # Skip this cycle if account data fails
 
-    # Step 2: Get coin data (Price, News Summary, Technicals)
+    # Step 2: Get coin data (Price, News Summary, Technical Indicators)
     print(f"\n2. Fetching {symbol} price, performance data and news...")
     # Pass the instantiated summary model here
     coin_data = get_coin_data(
         news_scraper_instance,
         indicators_scraper_instance,
-        gemini_summary_model, # Pass summary model
+        summary_model, # Pass summary model
         symbol
     )
 
@@ -548,11 +598,11 @@ def run_trading_cycle(alpaca_client, gemini_decision_model, gemini_summary_model
 
     print(f"{symbol} current price: ${coin_data.get('price')}")
 
-    # Step 3: Get trading decision from Gemini
-    print("\n3. Analyzing data with Google Gemini...")
+    # Step 3: Get trading decision from llm
+    print("\n3. Analyzing data with Google llm...")
     # Pass the instantiated decision model here
-    decision = ask_gemini_for_decision(account_data, coin_data, gemini_decision_model, gemini_summary_model)
-    print("\nGemini's Trading Decision:")
+    decision = ask_llm_for_decision(account_data, coin_data, decision_model, summary_model)
+    print(f"\n{decision_model} Trading Decision:")
     # Use .get with defaults for safer printing
     print(f"  Decision: {decision.get('decision', 'N/A')}")
     print(f"  Quantity: {decision.get('quantity', 'N/A')} {decision.get('quantity_unit', 'N/A')}")
@@ -581,22 +631,21 @@ if __name__ == "__main__":
 
     # --- Initial Setup & Checks ---
     # Check for essential API keys first
-    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY or not GOOGLE_API_KEY:
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         print("\nERROR: Required API keys not found in environment variables.")
         print("Please make sure your .env file is set up correctly with:")
         print("  - ALPACA_API_KEY")
         print("  - ALPACA_SECRET_KEY")
-        print("  - GOOGLE_GEMINI_API_KEY")
         sys.exit(1) # Exit if keys are missing
 
-    # Select Gemini Model (can be configured)
+    # Select llm Model (can be configured)
     # Using Pro for decisions, Flash for summaries (as example)
     try:
         # Initialize models needed
-        gemini_decision_model = genai.GenerativeModel('gemini-2.5-pro-exp-03-25')
-        gemini_summary_model = genai.GenerativeModel('gemini-2.5-flash-preview-04-17')
+        decision_model = "deepseek-r1:14b"
+        summary_model = "deepseek-r1:14b"
     except Exception as e:
-        print(f"FATAL: Failed to initialize Google Gemini models: {e}")
+        print(f"FATAL: Failed to initialize llm models: {e}")
         sys.exit(1)
 
     # --- Main Loop ---
@@ -606,8 +655,8 @@ if __name__ == "__main__":
             # Pass dependencies to the cycle function
             run_trading_cycle(
                 alpaca_client=trading_client,
-                gemini_decision_model=gemini_decision_model,
-                gemini_summary_model=gemini_summary_model, # Pass summary model
+                decision_model=decision_model,
+                summary_model=summary_model,
                 news_scraper_instance=news_scraper,
                 indicators_scraper_instance=indicators_scraper,
                 symbol=SYMBOL

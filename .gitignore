@@ -2,4 +2,4 @@
 .env
 .vscode
 export
-gemini-input.txt
+*-input.txt
