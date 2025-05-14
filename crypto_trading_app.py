@@ -393,6 +393,7 @@ def ask_llm_for_decision(account_data, coin_data, gen_model, sum_model):
     2. The quantity to buy or sell (in USD or {clean_symbol})
     3. Your reasoning for this decision
     4. A confidence level in your recommendation (low, medium, high)
+    5. Always HOLD if the proposed trade would worth less than $5
     
     Format your response as JSON with the following structure:
     {{
