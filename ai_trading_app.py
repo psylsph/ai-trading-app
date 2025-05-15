@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Automated Cryptocurrency Trading Application
+Automated Trading Application
 
 This app:
-1. Checks current cryptocurrency balance in an Alpaca account
+1. Checks current balance in an Alpaca account
 2. Fetches coin price and performance data
 3. Uses local llm to analyze data and make trading decisions
 4. Executes the determined trade on the Alpaca account
@@ -19,7 +19,6 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from tradingview_scraper.symbols.technicals import Indicators
-from tradingview_scraper.symbols.news import NewsScraper
 from dotenv import load_dotenv
 import sys # Added for sys.exit()
 import re # Added for regex in llm response parsing
@@ -32,7 +31,6 @@ SYMBOL = "XRPUSD" # Define symbol constant
 PRICING_SYMBOL = "ripple"
 SLEEP_INTERVAL_SECONDS = 600 # Define sleep interval constant
 DEBUG = True # Control debug file writing
-llm_client = OpenAI(base_url="http://127.0.0.1:11434/v1", api_key="ollama")
 
 # Load environment variables from .env file
 load_dotenv()
@@ -40,17 +38,16 @@ load_dotenv()
 # Get API keys from environment variables
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+llm_client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
 
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
 
-# --- Global Clients/Scrapers (Instantiate once) ---
-# Note: API key check happens before this in __main__
 trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True) # Use paper=False for live trading
 indicators_scraper = Indicators(export_result=False, export_type='json')
-news_scraper = NewsScraper(export_result=False, export_type='json')
 
 
 def get_account_info(client):
@@ -65,16 +62,16 @@ def get_account_info(client):
         positions = client.get_all_positions()
         # Filter specifically for the target symbol if needed, or all crypto
         # crypto_positions = [p for p in positions if p.symbol == SYMBOL]
-        crypto_positions = [p for p in positions if p.asset_class == 'crypto'] # More general crypto check
+        positions = [p for p in positions]
 
-        crypto_data = {
+        data = {
             "account_cash": float(account.cash),
             "portfolio_value": float(account.portfolio_value),
-            "crypto_positions": []
+            "positions": []
         }
 
-        print("\nCryptocurrency Positions:")
-        for position in crypto_positions:
+        print("\nPositions:")
+        for position in positions:
             pos_data = {
                 "symbol": position.symbol,
                 "qty": float(position.qty),
@@ -83,24 +80,22 @@ def get_account_info(client):
                 "unrealized_pl": float(position.unrealized_pl),
                 "current_price": float(position.current_price)
             }
-            crypto_data["crypto_positions"].append(pos_data)
+            data["positions"].append(pos_data)
 
             print(f"  {position.symbol}: {position.qty} shares worth ${float(position.market_value)}")
             print(f"    Cost Basis: ${float(position.cost_basis)}")
             print(f"    Unrealized P/L: ${round(float(position.unrealized_pl),2)}")
             print(f"    Current Price: ${float(position.current_price)}")
-        if len(crypto_data["crypto_positions"]) == 0:
-            print("  No cryptocurrency positions found.")
+        if len(data["positions"]) == 0:
+            print("  No positions found.")
 
-        return crypto_data
+        return data
     except (APIError, RequestException) as e: # Catch specific exceptions
         print(f"Error getting account info: {e}")
         return None
     except Exception as e: # Catch other unexpected errors
         print(f"Unexpected error getting account info: {e}")
         return None
-
-# Removed duplicated code block that was inserted here
 
 def get_technical_indicators(scraper, symbol: str):
     """Fetches technical indicators using the provided scraper instance."""
@@ -148,8 +143,6 @@ def get_llm_response(system_prompt: str, user_prompt: str, llm_model: str, tempe
         ],
         temperature=temperature,
         top_p=0.95,
-        max_completion_tokens=8192,
-        timeout=6000,
         stream=True
     )
     
@@ -199,7 +192,7 @@ def summarize_news(news_as_list: list, model):
     
     print(f"Sending news to {summary_model} for summarization...")
     try:
-        system_prompt = "You are crypto currency expert."
+        system_prompt = "You are crypto currency and stocks expert."
         response = get_llm_response(system_prompt, prompt, summary_model, temperature=0.2)
         return clean_string(response)
     except Exception as e:
@@ -207,46 +200,57 @@ def summarize_news(news_as_list: list, model):
         return "Error generating news summary."
 
 
-def get_coin_news(scraper, symbol: str, exchange: str = 'BINANCE'):
-    """Gets coin news using the provided scraper instance."""
+def get_news(symbol: str):
+
     news_list = []
-    try:
-        news_headlines = scraper.scrape_headlines(
-            symbol=symbol,
-            exchange=exchange,
-            sort='latest',
-        )
-        # Limit to top 10 articles
-        for article in news_headlines[:10]:
-            try:
-                news_content = scraper.scrape_news_content(story_path=article['storyPath'])
-                story = {
-                    'title': news_content.get('title', 'N/A'),
-                    'date': news_content.get('published_datetime', 'N/A'),
-                    'content': ""
-                }
-                # Safely concatenate content lines
-                for line in news_content.get('body', []):
-                    try:
-                        # Check if 'content' key exists and is not None
-                        if 'content' in line and line['content'] is not None:
-                            story['content'] += str(line['content']) # Ensure content is string
-                    except KeyError:
-                         # This handles if 'content' key is missing entirely
-                         print(f"Warning: 'content' key missing in news body line for article: {story['title']}")
-                    except Exception as inner_e: # Catch other potential errors during concatenation
-                         print(f"Warning: Error processing content line for article {story['title']}: {inner_e}")
+    url = "https://data.alpaca.markets/v1beta1/news?sort=desc&symbols=XRPUSD%2CXRP&limit=50&include_content=true&exclude_contentless=true"
 
-                news_list.append(story)
-            except Exception as article_e:
-                print(f"Error processing article {article.get('storyPath', 'N/A')}: {article_e}")
+    headers = {
+        "accept": "application/json",
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
+    }
+    response = requests.get(url, headers=headers)
+    response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+    data = response.json()
 
-    except Exception as e:
-        print(f"Error getting coin news headlines for {symbol}: {e}")
-        # Return empty list on error
-        return []
+    for article in data['news']:
+        summary = []
+        story = {
+            'headline': article.get('headline', 'N/A'),
+            'date': article.get('created_at', 'N/A'),
+            'summary': article.get('summary', 'N/A')
+        }
 
+        news_list.append(story)
     return news_list
+
+def get_recent_orders(symbol: str):
+
+    order_list = []
+    url = "https://paper-api.alpaca.markets/v2/orders?status=all"
+
+    headers = {
+        "accept": "application/json",
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
+    }
+    response = requests.get(url, headers=headers)
+    response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+    data = response.json()
+
+    for order in data:
+        if (order.get('symbol').replace("/", "") == symbol):
+            item = {
+                'filled_at': order.get('filled_at', 'N/A'),
+                'filled_qty': order.get('filled_qty', 'N/A'),
+                'filled_avg_price': order.get('filled_avg_price', 'N/A'),
+                'side': order.get('side', 'N/A'),
+                'status': order.get('status', 'N/A')
+            }
+
+            order_list.append(item)
+    return order_list[:5]
 
 
 def clean_string(input_string):
@@ -258,34 +262,43 @@ def clean_string(input_string):
     output_string = output_string.replace('"', "'").replace('\u2011', '-').replace('\u003c', '<').replace('\u003e', '>')
     return output_string
 
-def get_coin_data(news_scraper_instance, indicators_scraper_instance, summary_model, symbol: str):
-    """Aggregates coin data: news, technical, and price."""
-    coin_data = {
+
+def get_asset_data(indicators_scraper_instance, summary_model, symbol: str):
+    """Aggregates asset data: news, technical, and price."""
+    asset_data = {
         "price": None,
         "technical_indicators": {},
-        "recent_news_summary": "Not available" # Changed key name
+        "recent_news_summary": "Not available"
     }
 
     # Get news and summarize
     try:
-        raw_news = get_coin_news(news_scraper_instance, symbol)
+        raw_news = get_news(symbol)
         if raw_news:
              # Pass the separate summary model here
-             coin_data["recent_news_summary"] = summarize_news(raw_news, summary_model)
-             print(f"Recent News Summary:\n{coin_data['recent_news_summary']}")
+             asset_data["recent_news_summary"] = summarize_news(raw_news, summary_model)
+             print(f"Recent News Summary:\n{asset_data['recent_news_summary']}")
         else:
              print("No raw news fetched to summarize.")
-             coin_data["recent_news_summary"] = "No recent news found."
+             asset_data["recent_news_summary"] = "No recent news found."
     except Exception as e:
         print(f"Error fetching or summarizing news: {e}")
-        coin_data["recent_news_summary"] = f"Error fetching/summarizing news: {e}"
+        asset_data["recent_news_summary"] = f"Error fetching/summarizing news: {e}"
 
     # Get technical indicators
     try:
-        coin_data["technical_indicators"] = get_technical_indicators(indicators_scraper_instance, symbol)
+        asset_data["technical_indicators"] = get_technical_indicators(indicators_scraper_instance, symbol)
     except Exception as e:
-        print(f"Error fetching technical indicators in get_coin_data: {e}")
-        coin_data["technical_indicators"] = {"error": f"Failed to get technical indicators: {e}"}
+        print(f"Error fetching technical indicators in get_asset_data: {e}")
+        asset_data["technical_indicators"] = {"error": f"Failed to get technical indicators: {e}"}
+
+    # Get recent trades
+    try:
+        asset_data["recent_orders"] = get_recent_orders(symbol)
+    except Exception as e:
+        print(f"Error fetching recent trades: {e}")
+        asset_data["recent_orders"] = {"error": f"Failed to get recent trades: {e}"}
+
 
     # Use CoinGecko API for price data (more reliable than scraping for just price)
     try:
@@ -297,14 +310,14 @@ def get_coin_data(news_scraper_instance, indicators_scraper_instance, summary_mo
         current_price = market_data.get("current_price", {}).get("usd")
 
         if current_price is not None:
-             coin_data["price"] = float(current_price) # Ensure float
-             coin_data["24h_change"] = market_data.get("price_change_percentage_24h")
-             coin_data["7d_change"] = market_data.get("price_change_percentage_7d")
-             coin_data["market_cap"] = market_data.get("market_cap", {}).get("usd")
-             coin_data["24h_volume"] = market_data.get("total_volume", {}).get("usd")
+             asset_data["price"] = float(current_price) # Ensure float
+             asset_data["24h_change"] = market_data.get("price_change_percentage_24h")
+             asset_data["7d_change"] = market_data.get("price_change_percentage_7d")
+             asset_data["market_cap"] = market_data.get("market_cap", {}).get("usd")
+             asset_data["24h_volume"] = market_data.get("total_volume", {}).get("usd")
         else:
              print("Error: Could not find 'usd' price in CoinGecko response.")
-             coin_data["price"] = None # Explicitly set to None if not found
+             asset_data["price"] = None # Explicitly set to None if not found
 
     except RequestException as e:
         print(f"Error fetching from CoinGecko API: {e}")
@@ -314,7 +327,7 @@ def get_coin_data(news_scraper_instance, indicators_scraper_instance, summary_mo
         print(f"Unexpected error fetching price data: {e}")
         # Keep price as None if any error occurs
 
-    return coin_data
+    return asset_data
 
 
 def format_technical_indicators(indicators_dict):
@@ -349,7 +362,7 @@ def format_technical_indicators(indicators_dict):
         
     return "\n" + "\n".join(formatted_string)
 
-def ask_llm_for_decision(account_data, coin_data, gen_model, sum_model):
+def ask_llm_for_decision(account_data, asset_data, gen_model):
     """Send data to llm and get a trading decision"""
     # Model is now passed in
 
@@ -357,16 +370,17 @@ def ask_llm_for_decision(account_data, coin_data, gen_model, sum_model):
     # Use .get with defaults for safer access
     account_cash = account_data.get('account_cash', 'Unknown')
     portfolio_value = account_data.get('portfolio_value', 'Unknown')
-    crypto_positions = account_data.get('crypto_positions', [])
-    current_price = coin_data.get('price', 'Unknown')
-    change_24h = coin_data.get('24h_change', 'Unknown')
-    change_7d = coin_data.get('7d_change', 'Unknown')
-    tech_indicators = coin_data.get('technical_indicators', {})
-    news_summary = coin_data.get('recent_news_summary', 'Not available') # Use updated key
+    positions = account_data.get('positions', [])
+    current_price = asset_data.get('price', 'Unknown')
+    change_24h = asset_data.get('24h_change', 'Unknown')
+    change_7d = asset_data.get('7d_change', 'Unknown')
+    tech_indicators = asset_data.get('technical_indicators', {})
+    news_summary = asset_data.get('recent_news_summary', 'Not available')
     clean_symbol = SYMBOL.replace("USD", "")
+    recent_orders = asset_data.get('recent_orders', 'Not available')
 
     prompt = f"""
-    As a cryptocurrency trading advisor, please analyze the following data and recommend whether to buy, sell or hold coin,
+    As a trading advisor, please analyze the following data and recommend whether to buy, sell or hold coin,
     along with a suggested quantity. Please consider transaction fees in your decision.
     
     Current date and time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -377,7 +391,10 @@ def ask_llm_for_decision(account_data, coin_data, gen_model, sum_model):
     - Maker Fee: 0.15%, Taker Fee: 0.25%
 
     CURRENT {clean_symbol} HOLDINGS:
-    {json.dumps(crypto_positions, indent=2)}
+    {json.dumps(positions, indent=2)}
+
+    RECENT {clean_symbol} ORDERS:
+    {json.dumps(recent_orders, indent=2)}
 
     {clean_symbol} MARKET DATA:
     - Current Price: ${current_price}
@@ -419,7 +436,7 @@ def ask_llm_for_decision(account_data, coin_data, gen_model, sum_model):
     try:
         system_prompt = "You are crypto currency expert."
         try:
-            response_text = get_llm_response(system_prompt, prompt, decision_model, temperature=0.2)
+            response_text = get_llm_response(system_prompt, prompt, gen_model, temperature=0.2)
         except Exception as gen_ex:
             print(f"Warning: could not use {gen_model}: {gen_ex}")
         
@@ -569,7 +586,7 @@ def execute_trade(client, decision, symbol: str):
         return False
 
 
-def run_trading_cycle(alpaca_client, decision_model, summary_model, news_scraper_instance, indicators_scraper_instance, symbol: str):
+def run_trading_cycle(alpaca_client, decision_model, summary_model, indicators_scraper_instance, symbol: str):
     """Runs one cycle of the trading logic."""
     print("=" * 50)
     print(f"Starting Trading Cycle for {symbol} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -585,24 +602,23 @@ def run_trading_cycle(alpaca_client, decision_model, summary_model, news_scraper
     # Step 2: Get coin data (Price, News Summary, Technical Indicators)
     print(f"\n2. Fetching {symbol} price, performance data and news...")
     # Pass the instantiated summary model here
-    coin_data = get_coin_data(
-        news_scraper_instance,
+    asset_data = get_asset_data(
         indicators_scraper_instance,
         summary_model, # Pass summary model
         symbol
     )
 
     # Check if essential price data was retrieved
-    if coin_data.get("price") is None:
+    if asset_data.get("price") is None:
         print(f"Failed to retrieve {symbol} price data. Skipping cycle.")
         return # Skip cycle if price is missing
 
-    print(f"{symbol} current price: ${coin_data.get('price')}")
+    print(f"{symbol} current price: ${asset_data.get('price')}")
 
     # Step 3: Get trading decision from llm
-    print("\n3. Analyzing data with Google llm...")
+    print(f"\n3. Analyzing data with {summary_model} llm...")
     # Pass the instantiated decision model here
-    decision = ask_llm_for_decision(account_data, coin_data, decision_model, summary_model)
+    decision = ask_llm_for_decision(account_data, asset_data, decision_model)
     print(f"\n{decision_model} Trading Decision:")
     # Use .get with defaults for safer printing
     print(f"  Decision: {decision.get('decision', 'N/A')}")
@@ -643,8 +659,8 @@ if __name__ == "__main__":
     # Using Pro for decisions, Flash for summaries (as example)
     try:
         # Initialize models needed
-        decision_model = "deepseek-r1:14b"
-        summary_model = "deepseek-r1:14b"
+        decision_model = "deepseek-r1-distill-llama-70b"
+        summary_model = "deepseek-r1-distill-llama-70b"
     except Exception as e:
         print(f"FATAL: Failed to initialize llm models: {e}")
         sys.exit(1)
@@ -658,7 +674,6 @@ if __name__ == "__main__":
                 alpaca_client=trading_client,
                 decision_model=decision_model,
                 summary_model=summary_model,
-                news_scraper_instance=news_scraper,
                 indicators_scraper_instance=indicators_scraper,
                 symbol=SYMBOL
             )

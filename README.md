@@ -32,8 +32,8 @@ pip install -r requirements.txt
 ALPACA_API_KEY=your_alpaca_api_key_here
 ALPACA_SECRET_KEY=your_alpaca_secret_key_here
 
-# Google Gemini API credentials
-GOOGLE_GEMINI_API_KEY=your_google_gemini_api_key_here
+# GROQ API credentials
+GROQ_API_KEY==your_qroq_api_key_here
 ```
 
 3. Replace the placeholder values with your actual API keys
@@ -43,7 +43,7 @@ GOOGLE_GEMINI_API_KEY=your_google_gemini_api_key_here
 Execute the script with Python:
 
 ```bash
-python crypto_trading_app.py
+python ai_trading_app.py
 ```
 
 ## Getting API Keys
@@ -55,12 +55,9 @@ python crypto_trading_app.py
 3. Go to "API Keys" section and generate your keys
 4. Copy the API Key and Secret Key to your `.env` file
 
-### Google Gemini API Key
+### GROQ API Key
 
-1. Visit [Google AI Studio](https://makersuite.google.com/app/apikey)
-2. Sign in with your Google account
-3. Generate a new API key
-4. Copy the API key to your `.env` file
+1. TBC
 
 ## Important Notes
 
